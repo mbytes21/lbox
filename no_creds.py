@@ -2,178 +2,150 @@ import time
 import secrets
 import threading
 import sys
-from cloakbrowser import launch
+import subprocess
+import json
+import os
+import signal
+from playwright.sync_api import sync_playwright
 
 # ==========================================================
-# USER CONFIGURATION
+# CONFIGURATION
 # ==========================================================
 USERNAME = ""
 PASSWORD = ""
 PREFIX = "LBOX-"
-CODE_DELAY = 0.1 
-STATS_INTERVAL = 10 
+CODE_DELAY = 0.1  # Slightly increased for VM stability
+CODES_PER_SECTOR = 100
+SAVE_FILE = "progress.json"
 
-# High-priority sectors identified from reverse engineering
 ZONE_QUEUE = [
     "D0", "C4", "01", "87", "2B", "28", "19", "AE", "5D", "06", 
     "AD", "24", "FE", "C5", "9E", "89", "E3", "29", "36", "07", 
-    "EE", "E6", "5E", "94", "61", "B1", "F6", "A7", "D5", "E0", 
-    "D4", "4A", "B0", "92", "3A", "3E", "CA", "A6", "45", "BA", 
-    "D8", "5F", "58", "37", "57", "26", "7F", "8F", "25", "60", 
-    "66", "67", "9C", "8E", "86", "11", "98", "34", "2F", "B5", "C1"
-] 
-ZONE_THRESHOLD = 1048576 # 2^20 combinations per sector
+    "EE", "E6", "5E", "94", "61", "B1", "F6", "A7", "D5", "E0"
+]
+
+state = {"zone_index": 0, "codes_sent": 0, "total_session_attempts": 0}
+state_lock = threading.Lock()
+
 # ==========================================================
-
-window_stats = {}
-current_zone_index = 0
-codes_in_current_zone = 0
-stats_lock = threading.Lock()
-stop_event = threading.Event()
-start_time = time.time()
-
-def get_next_code():
-    """Manages global sector cycling across all threads"""
-    global current_zone_index, codes_in_current_zone
-    with stats_lock:
-        if codes_in_current_zone >= ZONE_THRESHOLD:
-            current_zone_index = (current_zone_index + 1) % len(ZONE_QUEUE)
-            codes_in_current_zone = 0
-            print(f"\n[System] Sector Complete. Moving to Zone: {ZONE_QUEUE[current_zone_index]}")
-        
-        active_zone = ZONE_QUEUE[current_zone_index]
-        codes_in_current_zone += 1
-        
-        # Suffix is 5 hex chars to complete the 7-char code
-        suffix = secrets.token_hex(3).upper()[:5]
-        return f"{PREFIX}{active_zone}{suffix}"
-
-def handle_login(page):
-    """Handles fresh login and existing session detection"""
-    try:
-        page.goto("https://lucidtrading.com/my-account/", wait_until="domcontentloaded", timeout=45000)
-        time.sleep(2)
-        
-        # Check if already logged in (based on page source provided)
-        if page.locator('text="Log out"').is_visible() or page.locator('.woocommerce-MyAccount-content').is_visible():
-            print("[System] Session valid. Skipping login fields.")
-        
-        # Fresh login required
-        elif page.locator('#log').is_visible():
-            page.locator('#log').fill(USERNAME)
-            page.locator('#pwd').fill(PASSWORD)
-            page.locator('#lucidLoginBtn').click(force=True)
-            page.wait_for_load_state("networkidle")
-            time.sleep(2)
-
-        # Move to the promo dashboard
-        page.goto("https://dash.lucidtrading.com/#/promo", wait_until="domcontentloaded", timeout=60000)
-        page.wait_for_selector('input.secret-redeem__input', timeout=30000)
-        return True
-    except Exception as e:
-        print(f"[System] Navigation Error: {str(e)[:60]}...")
-        return False
-
-def fast_vault_loop(page, window_index):
-    """The main injection loop"""
-    injection_js = """
-    (code) => {
-        const input = document.querySelector('input.secret-redeem__input');
-        const btn = document.querySelector('button.secret-redeem__btn');
-        if (input && btn) {
-            input.value = code;
-            input.dispatchEvent(new Event('input', { bubbles: true }));
-            btn.disabled = false;
-            btn.click();
-            return true;
-        }
-        return false;
-    }
-    """
-    check_counter = 0
-    while not stop_event.is_set():
-        # Periodically check if we are still on the promo page
-        check_counter += 1
-        if check_counter >= 200:
-            if not page.locator('input.secret-redeem__input').is_visible():
-                if not handle_login(page): 
-                    return # Exit to trigger self-healing respawn
-            check_counter = 0
-
-        code = get_next_code()
+# SYSTEM UTILITIES
+# ==========================================================
+def load_progress():
+    if os.path.exists(SAVE_FILE):
         try:
-            if page.evaluate(injection_js, code):
-                with stats_lock:
-                    window_stats[window_index] = window_stats.get(window_index, 0) + 1
-            time.sleep(CODE_DELAY)
-        except:
-            return # Trigger respawn on communication failure
-
-def self_healing_wrapper(window_index):
-    """Keeps the window running even if it crashes or times out"""
-    while not stop_event.is_set():
-        browser = None
-        try:
-            browser = launch(headless=False, humanize=False)
-            context = browser.new_context(viewport={'width': 1000, 'height': 700})
-            page = context.new_page()
-            
-            if handle_login(page):
-                print(f"[Window {window_index}] Success. Starting loop...")
-                fast_vault_loop(page, window_index)
-            else:
-                print(f"[Window {window_index}] Failed to reach promo page. Retrying...")
-                
+            with open(SAVE_FILE, "r") as f:
+                data = json.load(f)
+                state["zone_index"] = data.get("zone_index", 0)
+                state["codes_sent"] = data.get("codes_sent", 0)
+                print(f"[*] Resuming from Zone {ZONE_QUEUE[state['zone_index']]}")
         except Exception:
-            pass # Error handled by the restart loop
-        finally:
-            if browser:
-                try: browser.close()
-                except: pass
-            if not stop_event.is_set():
-                time.sleep(5) # Cooldown before respawning
+            print("[!] Progress file error, starting fresh.")
 
-def stats_reporter():
-    """Background thread for performance tracking"""
-    while not stop_event.is_set():
-        time.sleep(STATS_INTERVAL)
-        with stats_lock:
-            if window_stats:
-                elapsed = time.time() - start_time
-                time_str = time.strftime("%H:%M:%S", time.gmtime(elapsed))
-                total = sum(window_stats.values())
-                cpm = round(total / (elapsed / 60), 2) if elapsed > 0 else 0
-                current_zone = ZONE_QUEUE[current_zone_index]
+def save_to_disk():
+    with state_lock:
+        with open(SAVE_FILE, "w") as f:
+            json.dump({"zone_index": state["zone_index"], "codes_sent": state["codes_sent"]}, f)
+    print(f"\n[!] Progress saved to {SAVE_FILE}")
+
+def signal_handler(sig, frame):
+    save_to_disk()
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, signal_handler)
+
+# ==========================================================
+# CORE BROWSER ENGINE
+# ==========================================================
+def run_vault_worker(wid):
+    while True:
+        try:
+            with sync_playwright() as p:
+                # Optimized for Proxmox/VM environments
+                browser = p.chromium.launch(
+                    headless=False,
+                    args=[
+                        "--disable-blink-features=AutomationControlled",
+                        "--no-sandbox",
+                        "--disable-gpu",
+                        "--disable-dev-shm-usage",
+                        "--disable-software-rasterizer",
+                        "--window-size=1280,720"
+                    ]
+                )
                 
-                print(f"\n--- [STATS] {time_str} | Zone: {current_zone} ---")
-                print(f"Total Codes: {total} | Overall CPM: {cpm}")
-                print("-" * 40)
+                context = browser.new_context(
+                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                    viewport={'width': 1280, 'height': 720}
+                )
+                
+                # Anti-Detection Script
+                context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+                page = context.new_page()
+                
+                # Login Flow
+                print(f"[W{wid}] Accessing Login...")
+                page.goto("https://lucidtrading.com/my-account/", timeout=90000)
+                
+                if not page.get_by_text("Log out").is_visible(timeout=5000):
+                    page.locator('#log').fill(USERNAME)
+                    page.locator('#pwd').fill(PASSWORD)
+                    page.locator('#lucidLoginBtn').click()
+                    page.wait_for_load_state("networkidle")
+
+                # Navigate to Promo
+                page.goto("https://dash.lucidtrading.com/#/promo", wait_until="networkidle")
+                page.wait_for_selector('input.secret-redeem__input')
+                
+                print(f"[W{wid}] authenticated and ready.")
+
+                while True:
+                    with state_lock:
+                        current_zone = ZONE_QUEUE[state["zone_index"]]
+                        code = f"{PREFIX}{current_zone}{secrets.token_hex(3).upper()[:5]}"
+                        
+                        state["codes_sent"] += 1
+                        state["total_session_attempts"] += 1
+                        
+                        if state["codes_sent"] >= CODES_PER_SECTOR:
+                            state["zone_index"] = (state["zone_index"] + 1) % len(ZONE_QUEUE)
+                            state["codes_sent"] = 0
+                            save_to_disk() # Auto-save on sector change
+
+                    # Reliable JS Injection for Frameworks (React/Vue)
+                    page.evaluate(f"""() => {{
+                        const input = document.querySelector('input.secret-redeem__input');
+                        const btn = document.querySelector('button.secret-redeem__btn');
+                        if (input && btn) {{
+                            input.value = '{code}';
+                            input.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                            input.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                            btn.click();
+                        }}
+                    }}""")
+                    
+                    time.sleep(CODE_DELAY)
+
+        except Exception as e:
+            print(f"[W{wid}] Error: {e}. Restarting worker...")
+            time.sleep(10)
 
 def main():
+    load_progress()
     try:
-        num_windows_input = input("How many windows would you like to open? ")
-        num_windows = int(num_windows_input) if num_windows_input.strip() else 1
+        ans = input("Number of VM windows: ")
+        num = int(ans) if ans.strip() else 1
     except ValueError:
-        num_windows = 1
+        num = 1
 
-    # Start the stats thread
-    threading.Thread(target=stats_reporter, daemon=True).start()
-
-    # Launch the self-healing threads
-    threads = []
-    for i in range(num_windows):
-        if stop_event.is_set(): break
-        t = threading.Thread(target=self_healing_wrapper, args=(i + 1,), daemon=True)
+    for i in range(num):
+        t = threading.Thread(target=run_vault_worker, args=(i+1,), daemon=True)
         t.start()
-        threads.append(t)
-        time.sleep(2) # Staggered starts to prevent site lag
+        time.sleep(10) # Staggered start to prevent CPU spikes
 
-    try:
-        while any(t.is_alive() for t in threads):
-            time.sleep(1)
-    except KeyboardInterrupt:
-        print("\n[!] Shutdown signal received. Closing all windows...")
-        stop_event.set()
+    while True:
+        time.sleep(15)
+        with state_lock:
+            print(f" >> STATS | Total: {state['total_session_attempts']} | Zone: {ZONE_QUEUE[state['zone_index']]} ({state['codes_sent']}/{CODES_PER_SECTOR})")
 
 if __name__ == "__main__":
     main()
