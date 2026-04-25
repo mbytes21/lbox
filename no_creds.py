@@ -18,10 +18,12 @@ CODE_DELAY = 0.1  # Slightly increased for VM stability
 CODES_PER_SECTOR = 100
 SAVE_FILE = "progress.json"
 
-ZONE_QUEUE = [
-    "D0", "C4", "01", "87", "2B", "28", "19", "AE", "5D", "06", 
-    "AD", "24", "FE", "C5", "9E", "89", "E3", "29", "36", "07", 
-    "EE", "E6", "5E", "94", "61", "B1", "F6", "A7", "D5", "E0"
+ZONES = [
+    "FE", "C5", "9E", "89", "E3", "29", "36", "07", "EE", "E6", 
+    "5E", "94", "61", "B1", "F6", "A7", "D5", "E0", "D4", "4A", 
+    "B0", "92", "3A", "3E", "CA", "A6", "45", "BA", "D8", "5F", 
+    "58", "37", "57", "26", "7F", "8F", "25", "60", "66", "67", 
+    "9C", "8E", "86", "11", "98", "34", "2F", "B5", "C1"
 ]
 
 state = {"zone_index": 0, "codes_sent": 0, "total_session_attempts": 0}
