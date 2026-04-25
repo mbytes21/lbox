@@ -15,7 +15,7 @@ USERNAME = ""
 PASSWORD = ""
 PREFIX = "LBOX-"
 CODE_DELAY = 0.1  # Slightly increased for VM stability
-CODES_PER_SECTOR = 100
+CODES_PER_SECTOR = 5000
 SAVE_FILE = "progress.json"
 
 ZONES = [
